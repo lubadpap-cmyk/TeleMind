@@ -64,7 +64,7 @@ API_HASH=your_telegram_api_hash
 TG_PASSWORD=your_telegram_2fa_cloud_password
 
 # Persona details
-MY_NAME=Artem
+MY_NAME=
 
 # Active Engine (gemini / groq / local)
 AI_ENGINE=groq
