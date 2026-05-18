@@ -64,7 +64,7 @@ API_HASH=ваш_telegram_api_hash
 TG_PASSWORD=ваш_облачный_пароль
 
 # Имя (для системного промпта)
-MY_NAME=
+MY_NAME=YourName
 
 # Какой ИИ-движок использовать? (gemini / groq / local)
 AI_ENGINE=groq
