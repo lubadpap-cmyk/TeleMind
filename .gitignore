@@ -1,0 +1,25 @@
+# Environment secrets
+.env
+
+# Telethon active Telegram sessions (Contains credentials, DO NOT SHARE!)
+*.session
+*.session-journal
+
+# Local chat history cache
+chat_histories.json
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE configurations
+.vscode/
+.idea/
