@@ -6,6 +6,9 @@ import sys
 import os
 import logging
 import asyncio
+import time
+import random
+import json
 from collections import defaultdict
 from dotenv import load_dotenv
 
@@ -20,10 +23,22 @@ if sys.platform.startswith("win"):
 # --- Settings ---
 load_dotenv()
 
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
+API_ID_RAW = os.getenv("API_ID")
+API_ID = API_ID_RAW.strip() if API_ID_RAW else None
+API_HASH_RAW = os.getenv("API_HASH")
+API_HASH = API_HASH_RAW.strip() if API_HASH_RAW else None
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Support multiple API keys for Gemini (comma-separated or single)
+GEMINI_KEYS_RAW = os.getenv("GEMINI_API_KEYS", GEMINI_API_KEY)
+GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_RAW.split(",") if k.strip()] if GEMINI_KEYS_RAW else []
+if not GEMINI_KEYS and GEMINI_API_KEY:
+    GEMINI_KEYS = [GEMINI_API_KEY.strip()]
+
 MY_NAME = os.getenv("MY_NAME", "YourName")
+
+# Response mode (instant reply / human-like simulation with delays and typos)
+INSTANT_REPLY = os.getenv("INSTANT_REPLY", "True").lower() == "true"
 
 # AI Engine selection (gemini / local / groq)
 AI_ENGINE = os.getenv("AI_ENGINE", "gemini").lower()
@@ -31,16 +46,22 @@ if os.getenv("USE_LOCAL_AI", "False").lower() == "true":
     AI_ENGINE = "local"
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Support multiple API keys for Groq (comma-separated or single)
+GROQ_KEYS_RAW = os.getenv("GROQ_API_KEYS", GROQ_API_KEY)
+GROQ_KEYS = [k.strip() for k in GROQ_KEYS_RAW.split(",") if k.strip()] if GROQ_KEYS_RAW else []
+if not GROQ_KEYS and GROQ_API_KEY:
+    GROQ_KEYS = [GROQ_API_KEY.strip()]
+
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 LOCAL_AI_BASE_URL = os.getenv("LOCAL_AI_BASE_URL", "http://localhost:11434/v1")
 LOCAL_AI_MODEL = os.getenv("LOCAL_AI_MODEL", "llama3.2:1b")
 
 if not API_ID or not API_HASH:
     raise ValueError("❌ Please specify API_ID and API_HASH in your .env file")
-if AI_ENGINE == "gemini" and not GEMINI_API_KEY:
-    raise ValueError("❌ Please specify GEMINI_API_KEY in your .env file for Gemini")
-if AI_ENGINE == "groq" and not GROQ_API_KEY:
-    raise ValueError("❌ Please specify GROQ_API_KEY in your .env file for Groq")
+if AI_ENGINE == "gemini" and not GEMINI_KEYS:
+    raise ValueError("❌ Please specify GEMINI_API_KEY or GEMINI_API_KEYS in your .env file for Gemini")
+if AI_ENGINE == "groq" and not GROQ_KEYS:
+    raise ValueError("❌ Please specify GROQ_API_KEY or GROQ_API_KEYS in your .env file for Groq")
 
 # --- Logging ---
 logging.basicConfig(
@@ -50,33 +71,69 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- AI Clients Initialization ---
-gemini_client = None
+gemini_clients = []
+gemini_cooldowns = []
+groq_clients = []
+groq_cooldowns = []
 local_ai_client = None
 MODEL = "gemini-flash-latest"
 
-if AI_ENGINE in ("local", "groq"):
+# 1. Initialize Google Gemini clients for all keys
+if GEMINI_KEYS:
     try:
-        from openai import AsyncOpenAI
-        if AI_ENGINE == "groq":
-            local_ai_client = AsyncOpenAI(
-                base_url="https://api.groq.com/openai/v1",
-                api_key=GROQ_API_KEY
-            )
-            logger.info(f"🔌 Initialized ultra-fast Groq API client (Model: {GROQ_MODEL})")
-        else:
-            local_ai_client = AsyncOpenAI(
-                base_url=LOCAL_AI_BASE_URL,
-                api_key="local-ai"
-            )
-            logger.info(f"🔌 Initialized Local AI client (Model: {LOCAL_AI_MODEL})")
-    except ImportError:
-        print(f"❌ Error: Selected engine is {AI_ENGINE}, but the 'openai' package is not installed.")
+        from google import genai
+        for key in GEMINI_KEYS:
+            try:
+                client_instance = genai.Client(api_key=key)
+                masked = key[:6] + "..." + key[-4:] if len(key) > 10 else "..."
+                gemini_clients.append((client_instance, masked))
+                gemini_cooldowns.append(0.0)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to initialize Google Gemini client for key {key[:6]}...: {e}")
+        
+        if gemini_clients:
+            logger.info(f"🔌 Initialized {len(gemini_clients)} Google Gemini API clients")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to import genai / initialize Google Gemini: {e}")
+
+# 2. Initialize Groq & Local AI clients if openai is installed
+try:
+    from openai import AsyncOpenAI
+    
+    if GROQ_KEYS:
+        for key in GROQ_KEYS:
+            try:
+                client_instance = AsyncOpenAI(
+                    base_url="https://api.groq.com/openai/v1",
+                    api_key=key
+                )
+                masked = key[:6] + "..." + key[-4:] if len(key) > 10 else "..."
+                groq_clients.append((client_instance, masked))
+                groq_cooldowns.append(0.0)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to initialize Groq client for key {key[:6]}...: {e}")
+                
+        if groq_clients:
+            logger.info(f"🔌 Initialized {len(groq_clients)} Groq API clients")
+    
+    local_ai_client = AsyncOpenAI(
+        base_url=LOCAL_AI_BASE_URL,
+        api_key="local-ai"
+    )
+    logger.info(f"🔌 Initialized Local AI client (Model: {LOCAL_AI_MODEL})")
+
+except ImportError:
+    # Only raise fatal error if the user set a default boot engine that requires openai
+    if AI_ENGINE in ("local", "groq"):
+        print(f"❌ Error: Selected boot engine is {AI_ENGINE}, but the 'openai' package is not installed.")
         print("👉 Please run in terminal: pip install openai")
         sys.exit(1)
-else:
-    from google import genai
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    logger.info("🔌 Initialized Google Gemini API client")
+    else:
+        logger.warning("⚠️ 'openai' package not found. Groq and Local AI engines will not be available. Install with: pip install openai")
+
+# Backward compatibility pointers for commands and validations
+gemini_client = gemini_clients[0][0] if gemini_clients else None
+groq_client = groq_clients[0][0] if groq_clients else None
 
 # --- AI Persona & Chat System Prompt ---
 # NOTE: The persona rules and examples below are tailored to chat naturally
@@ -140,7 +197,6 @@ def load_histories():
     global chat_histories
     if os.path.exists(HISTORY_FILE):
         try:
-            import json
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 chat_histories.clear()
@@ -154,7 +210,6 @@ def load_histories():
 def save_histories():
     """Save updated chat histories to local JSON file."""
     try:
-        import json
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             # Convert int keys to string for JSON serialization
             data = {str(k): v for k, v in chat_histories.items()}
@@ -177,65 +232,206 @@ def add_message(chat_id: int, role: str, text: str):
     save_histories()
 
 
-# --- AI Text Generation ---
+# --- AI Text Generation with Self-Healing Fallback ---
 
-async def generate_response(chat_id: int, user_message: str) -> str:
-    """Queries the active AI engine (Gemini, Groq, or Local) and returns a generated response."""
-    add_message(chat_id, "user", user_message)
-    history = get_history(chat_id)
+# Track engine cooldowns (engine_name -> float (timestamp when cooldown ends))
+engine_cooldowns = {}
+COOLDOWN_DURATION = 90  # Put a failed API key / engine on cooldown for 90 seconds
 
-    if AI_ENGINE in ("local", "groq"):
-        # Format structured message list for OpenAI-compatible clients
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-        for msg in history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
+def mark_engine_failed(engine_name: str):
+    """Mark an engine as failed to log the incident."""
+    logger.warning(f"📉 Engine {engine_name.upper()} has completely exhausted all available keys/retries.")
 
-        active_model = LOCAL_AI_MODEL if AI_ENGINE == "local" else GROQ_MODEL
+def mark_client_failed(engine_name: str, client_idx: int):
+    """Mark a specific client key as failed and put it on cooldown for 90s."""
+    now = time.time()
+    cooldown_expiry = now + COOLDOWN_DURATION
+    if engine_name == "gemini":
+        gemini_cooldowns[client_idx] = cooldown_expiry
+        masked = gemini_clients[client_idx][1]
+        logger.warning(f"📉 Gemini API Key #{client_idx+1} ({masked}) on cooldown for {COOLDOWN_DURATION}s due to rate limit/error.")
+    elif engine_name == "groq":
+        groq_cooldowns[client_idx] = cooldown_expiry
+        masked = groq_clients[client_idx][1]
+        logger.warning(f"📉 Groq API Key #{client_idx+1} ({masked}) on cooldown for {COOLDOWN_DURATION}s due to rate limit/error.")
 
-        try:
-            response = await local_ai_client.chat.completions.create(
-                model=active_model,
-                messages=messages,
-                temperature=0.7,
-            )
-            reply = response.choices[0].message.content.strip().replace("(", "").replace(")", "")
-            add_message(chat_id, "assistant", reply)
-            return reply
-        except Exception as e:
-            logger.error(f"AI Client Error ({AI_ENGINE}): {e}")
-            return "сорри, нейросеть прилегла, напиши чуть позже 😅"
+def is_engine_healthy(engine_name: str) -> bool:
+    """Check if the engine has at least one healthy (not on cooldown) API key."""
+    now = time.time()
+    if engine_name == "gemini":
+        if not gemini_clients:
+            return False
+        return any(now > t for t in gemini_cooldowns)
+    elif engine_name == "groq":
+        if not groq_clients:
+            return False
+        return any(now > t for t in groq_cooldowns)
+    elif engine_name == "local":
+        cooldown_until = engine_cooldowns.get("local", 0)
+        return now > cooldown_until
+    return False
+
+def get_engine_attempts() -> list[str]:
+    """Returns a list of configured engines, prioritizing healthy ones, with failed ones as last resort."""
+    available = []
+    if AI_ENGINE == "gemini":
+        available = ["gemini", "groq", "local"]
+    elif AI_ENGINE == "groq":
+        available = ["groq", "gemini", "local"]
     else:
-        # Generate content with Gemini API
+        available = ["local", "gemini", "groq"]
+
+    # Filter out unconfigured clients
+    configured = []
+    for eng in available:
+        if eng == "gemini" and gemini_clients:
+            configured.append(eng)
+        elif eng == "groq" and groq_clients:
+            configured.append(eng)
+        elif eng == "local" and local_ai_client is not None:
+            configured.append(eng)
+
+    # Put healthy engines first, then cooldown ones as a last-resort backup
+    healthy = [eng for eng in configured if is_engine_healthy(eng)]
+    unhealthy = [eng for eng in configured if not is_engine_healthy(eng)]
+    
+    return healthy + unhealthy
+
+async def query_engine(engine_name: str, history: list[dict]) -> str:
+    """Queries a specific AI engine, smart-rotating through all configured API keys if rate-limited."""
+    now = time.time()
+
+    if engine_name == "gemini":
+        if not gemini_clients:
+            raise ValueError("No Gemini clients are initialized")
+        
+        # Sort indices: healthy keys first, then cooldown ones (least remaining cooldown first)
+        healthy_indices = [i for i in range(len(gemini_clients)) if now > gemini_cooldowns[i]]
+        cooldown_indices = sorted([i for i in range(len(gemini_clients)) if now <= gemini_cooldowns[i]], key=lambda i: gemini_cooldowns[i])
+        client_indices = healthy_indices + cooldown_indices
+
         prompt = SYSTEM_PROMPT + "\n\nChat History:\n"
         for msg in history:
             prefix = "Friend" if msg["role"] == "user" else MY_NAME
             prompt += f"{prefix}: {msg['content']}\n"
         prompt += f"\nReply as {MY_NAME}:"
 
-        # Simple retry logic in case of Google rate-limiting (429)
-        for attempt in range(3):
-            try:
-                response = await gemini_client.aio.models.generate_content(
-                    model=MODEL,
-                    contents=[prompt],
-                )
-                reply = response.text.strip().replace("(", "").replace(")", "")
-                add_message(chat_id, "assistant", reply)
-                return reply
+        last_err = None
+        for idx in client_indices:
+            client_inst, masked = gemini_clients[idx]
+            # Fast retry loop per key
+            for attempt in range(2):
+                try:
+                    if idx > 0 or now <= gemini_cooldowns[idx]:
+                        logger.info(f"🔑 Querying Gemini API Key #{idx+1} ({masked})")
 
-            except Exception as e:
-                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    wait_time = (attempt + 1) * 3
-                    logger.warning(f"⚠️ Gemini Rate Limit (429). Waiting {wait_time}s... (Attempt {attempt+1}/3)")
-                    await asyncio.sleep(wait_time)
-                    continue
-                
-                logger.error(f"Gemini API Error: {e}")
-                break
-                
-        return "сорри, что-то пошло не так, напиши позже 😅"
+                    response = await client_inst.aio.models.generate_content(
+                        model=MODEL,
+                        contents=[prompt],
+                    )
+                    return response.text.strip().replace("(", "").replace(")", "")
+                except Exception as e:
+                    if ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)) and attempt < 1:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(f"⚠️ Gemini API Key #{idx+1} Rate Limit. Waiting {wait_time}s... (Attempt {attempt+1}/2)")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    logger.warning(f"⚠️ Gemini API Key #{idx+1} ({masked}) failed: {e}")
+                    mark_client_failed("gemini", idx)
+                    last_err = e
+                    break  # Go to the next API key immediately
+        
+        raise last_err if last_err else ValueError("All Gemini keys failed")
+
+    elif engine_name == "groq":
+        if not groq_clients:
+            raise ValueError("No Groq clients are initialized")
+
+        healthy_indices = [i for i in range(len(groq_clients)) if now > groq_cooldowns[i]]
+        cooldown_indices = sorted([i for i in range(len(groq_clients)) if now <= groq_cooldowns[i]], key=lambda i: groq_cooldowns[i])
+        client_indices = healthy_indices + cooldown_indices
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+        last_err = None
+        for idx in client_indices:
+            client_inst, masked = groq_clients[idx]
+            for attempt in range(2):
+                try:
+                    if idx > 0 or now <= groq_cooldowns[idx]:
+                        logger.info(f"🔑 Querying Groq API Key #{idx+1} ({masked})")
+
+                    response = await client_inst.chat.completions.create(
+                        model=GROQ_MODEL,
+                        messages=messages,
+                        temperature=0.7,
+                    )
+                    return response.choices[0].message.content.strip().replace("(", "").replace(")", "")
+                except Exception as e:
+                    if ("429" in str(e) or "rate" in str(e).lower()) and attempt < 1:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(f"⚠️ Groq API Key #{idx+1} Rate Limit. Waiting {wait_time}s... (Attempt {attempt+1}/2)")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    logger.warning(f"⚠️ Groq API Key #{idx+1} ({masked}) failed: {e}")
+                    mark_client_failed("groq", idx)
+                    last_err = e
+                    break
+        
+        raise last_err if last_err else ValueError("All Groq keys failed")
+
+    elif engine_name == "local":
+        if not local_ai_client:
+            raise ValueError("Local AI client is not configured")
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for msg in history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+
+        try:
+            response = await local_ai_client.chat.completions.create(
+                model=LOCAL_AI_MODEL,
+                messages=messages,
+                temperature=0.7,
+            )
+            return response.choices[0].message.content.strip().replace("(", "").replace(")", "")
+        except Exception as e:
+            engine_cooldowns["local"] = time.time() + COOLDOWN_DURATION
+            raise e
+    else:
+        raise ValueError(f"Unsupported AI Engine: {engine_name}")
+
+async def generate_response(chat_id: int, user_message: str) -> str:
+    """Queries the AI engines with automatic self-healing fallback and rate-limit protection."""
+    add_message(chat_id, "user", user_message)
+    history = get_history(chat_id)
+
+    engines = get_engine_attempts()
+    if not engines:
+        return "сорри, ни один ИИ-движок не настроен в .env 😅"
+
+    for idx, engine in enumerate(engines):
+        try:
+            if engine != AI_ENGINE:
+                logger.info(f"🔄 Fallback attempt: Using {engine.upper()} (Primary {AI_ENGINE.upper()} unavailable/on cooldown)")
+            else:
+                logger.info(f"🧠 Querying active engine: {engine.upper()}")
+
+            reply = await query_engine(engine, history)
+            add_message(chat_id, "assistant", reply)
+            return reply
+
+        except Exception as e:
+            logger.error(f"❌ {engine.upper()} query failed: {e}")
+            mark_engine_failed(engine)
+
+    # All engines failed
+    logger.critical("🚨 All configured AI engines failed to generate a response!")
+    return "сорри, все нейросети прилегли, напиши чуть позже 😅"
 
 
 # --- Telethon Client Instantiation ---
@@ -263,12 +459,102 @@ async def toggle_ai(event):
 
     if command == "on":
         auto_reply_enabled = True
-        await event.edit("✅ AI Auto-Reply Enabled")
+        try:
+            await event.edit("✅ AI Auto-Reply Enabled")
+        except Exception:
+            pass
     else:
         auto_reply_enabled = False
-        await event.edit("⛔ AI Auto-Reply Disabled")
+        try:
+            await event.edit("⛔ AI Auto-Reply Disabled")
+        except Exception:
+            pass
 
     logger.info(f"AI Auto-Reply state: {'ENABLED' if auto_reply_enabled else 'DISABLED'}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.ai instant (on|off)$"))
+async def toggle_instant(event):
+    """Enable or disable instant replies. Usage: .ai instant on / .ai instant off"""
+    global INSTANT_REPLY
+    command = event.pattern_match.group(1)
+
+    if command == "on":
+        INSTANT_REPLY = True
+        try:
+            await event.edit("⚡ AI Instant Reply Mode Enabled (No delays, no typos)")
+        except Exception:
+            pass
+    else:
+        INSTANT_REPLY = False
+        try:
+            await event.edit("👤 AI Human Simulation Mode Enabled (With delays and typos)")
+        except Exception:
+            pass
+
+    logger.info(f"AI Instant Reply state: {'ENABLED' if INSTANT_REPLY else 'DISABLED'}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.ai engine (gemini|groq|local)$"))
+async def switch_engine(event):
+    """Switch active AI engine. Usage: .ai engine gemini / .ai engine groq / .ai engine local"""
+    global AI_ENGINE
+    new_engine = event.pattern_match.group(1).lower()
+
+    if new_engine == "gemini" and not gemini_clients:
+        try:
+            await event.edit("❌ Gemini clients are not initialized (check GEMINI_API_KEYS in .env)")
+        except Exception:
+            pass
+        return
+    elif new_engine == "groq" and not groq_clients:
+        try:
+            await event.edit("❌ Groq clients are not initialized (check GROQ_API_KEYS in .env)")
+        except Exception:
+            pass
+        return
+    elif new_engine == "local" and not local_ai_client:
+        try:
+            await event.edit("❌ Local AI client is not initialized")
+        except Exception:
+            pass
+        return
+
+    AI_ENGINE = new_engine
+    engine_cooldowns.pop(AI_ENGINE, None)  # Reset cooldown if manually selected
+    # Reset all key cooldowns for the selected engine
+    if AI_ENGINE == "gemini":
+        for i in range(len(gemini_cooldowns)):
+            gemini_cooldowns[i] = 0.0
+    elif AI_ENGINE == "groq":
+        for i in range(len(groq_cooldowns)):
+            groq_cooldowns[i] = 0.0
+    active_model = MODEL if AI_ENGINE == "gemini" else (GROQ_MODEL if AI_ENGINE == "groq" else LOCAL_AI_MODEL)
+    try:
+        await event.edit(f"🔌 AI Engine switched to **{AI_ENGINE.upper()}** (Model: `{active_model}`)")
+    except Exception:
+        pass
+    logger.info(f"AI Engine manually switched to: {AI_ENGINE.upper()}")
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.ai model (.+)$"))
+async def switch_model(event):
+    """Switch the model for the active engine. Usage: .ai model <model_name>"""
+    global MODEL, GROQ_MODEL, LOCAL_AI_MODEL
+    new_model = event.pattern_match.group(1).strip()
+
+    if AI_ENGINE == "gemini":
+        MODEL = new_model
+    elif AI_ENGINE == "groq":
+        GROQ_MODEL = new_model
+    else:
+        LOCAL_AI_MODEL = new_model
+
+    try:
+        await event.edit(f"🧠 Active model for **{AI_ENGINE.upper()}** switched to: `{new_model}`")
+    except Exception:
+        pass
+    logger.info(f"Model for {AI_ENGINE.upper()} switched to: {new_model}")
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ai clear$"))
@@ -277,31 +563,62 @@ async def clear_context(event):
     chat_id = event.chat_id
     chat_histories[chat_id] = []
     save_histories()
-    await event.edit("🧹 Chat Context Cleared")
+    try:
+        await event.edit("🧹 Chat Context Cleared")
+    except Exception:
+        pass
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^\.ai status$"))
 async def ai_status(event):
-    """Display active bot stats. Usage: .ai status"""
+    """Display active bot stats and engine health. Usage: .ai status"""
     status = "✅ ENABLED" if auto_reply_enabled else "⛔ DISABLED"
+    mode_status = "⚡ INSTANT" if INSTANT_REPLY else "👤 HUMAN-LIKE"
     chats_count = len(chat_histories)
-    if AI_ENGINE == "local":
-        engine_name = "Local Ollama"
-        model_name = LOCAL_AI_MODEL
-    elif AI_ENGINE == "groq":
-        engine_name = "Groq Cloud"
-        model_name = GROQ_MODEL
-    else:
-        engine_name = "Google Gemini"
-        model_name = MODEL
+    now = time.time()
 
-    await event.edit(
-        f"🤖 **AI Auto-Reply Status:** {status}\n"
-        f"💬 **Active Chats Cache:** {chats_count}\n"
-        f"🔌 **Active Engine:** {engine_name}\n"
-        f"🧠 **Model:** `{model_name}`\n"
-        f"📚 **Context Window:** {MAX_HISTORY} messages"
-    )
+    def get_engine_status_str(name, label, clients_list, cooldowns_list, model_val):
+        if not clients_list:
+            return f"  • {label}: ❌ Not Configured"
+        
+        status_lines = [f"  • {label}: `{model_val}`"]
+        for idx, (client_inst, masked) in enumerate(clients_list):
+            cooldown_until = cooldowns_list[idx]
+            remaining = int(cooldown_until - now)
+            if remaining > 0:
+                status_lines.append(f"      Key #{idx+1} ({masked}): ⏳ Cooldown ({remaining}s)")
+            else:
+                status_lines.append(f"      Key #{idx+1} ({masked}): 🟢 Healthy")
+        return "\n".join(status_lines)
+
+    gemini_info = get_engine_status_str("gemini", "Google Gemini", gemini_clients, gemini_cooldowns, MODEL)
+    groq_info = get_engine_status_str("groq", "Groq Cloud", groq_clients, groq_cooldowns, GROQ_MODEL)
+    
+    if not local_ai_client:
+        local_info = "  • Local Ollama: ❌ Not Configured"
+    else:
+        cooldown_until = engine_cooldowns.get("local", 0)
+        remaining = int(cooldown_until - now)
+        if remaining > 0:
+            local_info = f"  • Local Ollama: `{LOCAL_AI_MODEL}` ⏳ Cooldown ({remaining}s)"
+        elif AI_ENGINE == "local":
+            local_info = f"  • Local Ollama: `{LOCAL_AI_MODEL}` 🟢 Active & Healthy"
+        else:
+            local_info = f"  • Local Ollama: `{LOCAL_AI_MODEL}` 🔵 Ready & Healthy"
+
+    try:
+        await event.edit(
+            f"🤖 **AI Auto-Reply Status:** {status}\n"
+            f"⚡ **Response Mode:** {mode_status}\n"
+            f"💬 **Active Chats Cache:** {chats_count}\n"
+            f"📚 **Context Window:** {MAX_HISTORY} messages\n\n"
+            f"🔌 **AI Engines & Status:**\n"
+            f"{gemini_info}\n"
+            f"{groq_info}\n"
+            f"{local_info}"
+        )
+    except Exception:
+        pass
 
 
 # --- Incoming Message Handlers & Human Simulation ---
@@ -326,6 +643,14 @@ async def handle_incoming(event):
     if not event.text or event.text.startswith((".", "/")):
         return
 
+    # Critical bug fix: Ignore official Telegram bots and self-messages to prevent infinite loops
+    try:
+        sender = await event.get_sender()
+        if sender and (getattr(sender, 'bot', False) or sender.id == my_user_id):
+            return
+    except Exception as e:
+        logger.warning(f"Failed to get sender info: {e}")
+
     chat_id = event.chat_id
     
     # Store incoming text in the accumulation buffer
@@ -336,15 +661,16 @@ async def handle_incoming(event):
         active_accumulators[chat_id].cancel()
 
     # Wait for 2.0 seconds of silence before packing and generating a combined reply
-    loop = asyncio.get_event_loop()
-    task = loop.create_task(wait_and_respond(chat_id, event))
+    task = asyncio.create_task(wait_and_respond(chat_id, event))
     active_accumulators[chat_id] = task
 
 
 async def wait_and_respond(chat_id: int, event):
     """Waits for consecutive texts to conclude and passes the combined message to the reply routine."""
     try:
-        await asyncio.sleep(2.0)
+        # In instant mode, wait for a very short debounce (0.2s) instead of 2.0s to feel immediate
+        wait_delay = 0.2 if INSTANT_REPLY else 2.0
+        await asyncio.sleep(wait_delay)
         
         texts = message_buffers[chat_id]
         message_buffers[chat_id] = []
@@ -367,18 +693,17 @@ def introduce_typo(text: str) -> tuple[str, str | None]:
     Returns a tuple: (typo_text, clean_correction_word).
     If no typo is introduced, returns (original_text, None).
     """
-    import random
-    
     # 15% chance to make a typo
     if random.random() > 0.15:
         return text, None
         
     words = text.split()
-    # Find Russian words of length >= 5
+    # Find Russian words of length >= 5, supporting letter "ё" and "Ё" correctly
     eligible_indices = []
+    cyrillic_chars = 'абвгдеёжзийклмнопрстуфхцчшщъыьэюя'
     for idx, w in enumerate(words):
         clean_w = "".join(c for c in w if c.isalpha())
-        if len(clean_w) >= 5 and any(1040 <= ord(c) <= 1103 for c in clean_w):
+        if len(clean_w) >= 5 and any(c.lower() in cyrillic_chars for c in clean_w):
             eligible_indices.append(idx)
             
     if not eligible_indices:
@@ -418,14 +743,23 @@ async def process_reply(chat_id: int, combined_text: str, event):
 
     logger.info(f"📩 Incoming DM from {sender_name} ({chat_id}): {combined_text}")
 
+    if INSTANT_REPLY:
+        # Show typing status while generating to indicate immediate activity
+        try:
+            async with client.action(event.input_chat, "typing"):
+                original_reply = await generate_response(chat_id, combined_text)
+        except Exception:
+            original_reply = await generate_response(chat_id, combined_text)
+        
+        logger.info(f"📤 Sent reply instantly → ({chat_id}): {original_reply}")
+        await event.respond(original_reply)
+        return
+
     # Generate response
     original_reply = await generate_response(chat_id, combined_text)
 
     # Introduce a typo with a 15% probability
     typo_reply, correction = introduce_typo(original_reply)
-
-    import random
-    import asyncio
 
     # ⏳ "Reading Effect" Delay (Simulate the user reading the message before typing)
     read_delay = random.uniform(1.2, 2.5)
@@ -506,10 +840,14 @@ async def main():
     print(f"📚 Context Window Limit: {MAX_HISTORY} messages")
     print("─" * 50)
     print("Self-Admin Commands (type these in any chat):")
-    print("  .ai on     — Enable auto-reply")
-    print("  .ai off    — Disable auto-reply")
-    print("  .ai clear  — Wipe chat history cache for the current chat")
-    print("  .ai status — View current running statistics")
+    print("  .ai on              — Enable auto-reply")
+    print("  .ai off             — Disable auto-reply")
+    print("  .ai instant on      — Enable instant replies (no delay, no typos)")
+    print("  .ai instant off     — Disable instant replies (human-like simulation)")
+    print("  .ai engine <engine> — Switch active engine (gemini, groq, local)")
+    print("  .ai model <model>   — Switch active model for the current engine")
+    print("  .ai clear           — Wipe chat history cache for the current chat")
+    print("  .ai status          — View current running statistics")
     print("─" * 50)
 
     # Load cache
@@ -527,5 +865,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
